@@ -1,0 +1,209 @@
+
+#version 310 es
+#extension GL_ARB_compute_variable_group_size : enable
+
+// IO
+layout(local_size_variable) in;
+
+layout(std430, binding=0) buffer adaptiveProbeWSPosition {
+    vec4 adaptiveProbeWSPosData[];
+};
+
+layout(std430, binding=1) buffer adaptiveProbeSSPosition {
+    vec4 adaptiveProbeSSPosData[];
+};
+
+layout(std430, binding=2) buffer screenTileHeader {
+    int screenTileHeaderData[];
+};
+
+layout(std430, binding=3) buffer screenTileAdaptiveProbeIndices {
+    int screenTileProbeIndex[];
+};
+
+layout(std430, binding=4) buffer adaptiveProbeNum {
+    int probeNum;
+};
+
+// Uniform
+uniform int placementDownsampleFactor;
+uniform int screenProbeDownsampleFactor;
+uniform float viewport_width;
+uniform float viewport_height;
+
+// Texture
+uniform sampler2D   ws_positionTexture;
+uniform sampler2D   depthTexture;
+uniform sampler2D   ws_normalTexture;
+
+struct FScreenProbeSample
+{
+	ivec2 SSCoord[4];
+	vec4 weights;
+};
+
+ivec2 GetAdaptiveProbeCoord(ivec2 screenTileCoord, int adaptiveProbeListIndex){
+
+	ivec2 adaptiveProbeCoord = ivec2(adaptiveProbeListIndex % screenProbeDownsampleFactor, adaptiveProbeListIndex / screenProbeDownsampleFactor);
+	//return ScreenTileCoord * ScreenProbeDownsampleFactor + AdaptiveProbeCoord;
+	return ivec2(adaptiveProbeCoord.x * viewport_width / screenProbeDownsampleFactor, adaptiveProbeCoord.y * viewport_height / screenProbeDownsampleFactor) + screenTileCoord;
+
+}
+
+// 找到该点对应的4个uniform probe
+void CalculateUniformUpsampleInterpolationWeights(ivec2 screenCoord, vec3 wsPosition, float sceneDepth, vec3 worldNormal, out ivec2 screenTileCoord00, out vec4 interpolationWeights){
+    
+	
+    int tileSize = screenProbeDownsampleFactor;
+    screenTileCoord00 = screenCoord / tileSize; 
+
+	int bilinearExpand = 1;
+	vec2 bilinearWeights = (screenCoord - screenTileCoord00 * tileSize + bilinearExpand) / (float)(tileSize + 2 * bilinearExpand);
+
+	vec4 cornerDepths;
+
+    
+    cornerDepths.x = texelFetch(depthTexture, screenTileCoord00 * tileSize, 0).r;
+	cornerDepths.y = texelFetch(depthTexture, ivec2((screenTileCoord00 + ivec2(1, 0)) * tileSize), 0).r;
+    cornerDepths.z = texelFetch(depthTexture, ivec2((screenTileCoord00 + ivec2(0, 1)) * tileSize), 0).r;
+    cornerDepths.w = texelFetch(depthTexture, ivec2((screenTileCoord00 + ivec2(1, 1)) * tileSize), 0).r;
+
+
+	interpolationWeights = vec4(
+		(1 - bilinearWeights.y) * (1 - bilinearWeights.x),
+		(1 - bilinearWeights.y) * bilinearWeights.x,
+		bilinearWeights.y * (1 - bilinearWeights.x),
+		bilinearWeights.y * bilinearWeights.x);
+
+	vec4 depthWeights;
+    vec4 scenePlane = vec4(worldNormal, dot(wsPosition, worldNormal));
+
+    vec3 position00 = texelFetch(ws_positionTexture, screenTileCoord00 * tileSize, 0).rgb;
+    vec3 position10 = texelFetch(ws_positionTexture, (screenTileCoord00 + ivec2(1, 0)) * tileSize, 0).rgb;
+    vec3 position01 = texelFetch(ws_positionTexture, (screenTileCoord00 + ivec2(0, 1)) * tileSize, 0).rgb;
+    vec3 position11 = texelFetch(ws_positionTexture, (screenTileCoord00 + ivec2(1, 1)) * tileSize, 0).rgb;
+
+    vec4 planeDistances;
+    planeDistances.x = abs(dot(vec4(position00, -1), scenePlane));
+    planeDistances.y = abs(dot(vec4(position10, -1), scenePlane));
+    planeDistances.z = abs(dot(vec4(position01, -1), scenePlane));
+    planeDistances.w = abs(dot(vec4(position11, -1), scenePlane));
+        
+    vec4 relativeDepthDifference = planeDistances / sceneDepth;
+
+    // TO Confirm
+    depthWeights = ((cornerDepths.x > 0) && (cornerDepths.y > 0)  && (cornerDepths.z > 0) && (cornerDepths.w > 0)) ? exp2(-10000.0f * (relativeDepthDifference * relativeDepthDifference)) : vec4(0,0,0,0);
+
+    interpolationWeights *= depthWeights;
+}
+
+
+
+void CalculateUpsampleInterpolationWeights(ivec2 screenCoord, vec3 wsPosition, float sceneDepth, vec3 worldNormal, out FScreenProbeSample screenProbeSample){
+
+    ivec2 screenTileCoord00;
+    CalculateUniformUpsampleInterpolationWeights(screenCoord, wsPosition, sceneDepth, worldNormal, screenTileCoord00, screenProbeSample.weights);
+    int tileSize = screenProbeDownsampleFactor; 
+    screenProbeSample.SSCoord[0] = screenTileCoord00 * tileSize;
+	screenProbeSample.SSCoord[1] = (screenTileCoord00 + ivec2(1, 0)) * tileSize;
+	screenProbeSample.SSCoord[2] = (screenTileCoord00 + ivec2(0, 1)) * tileSize;
+	screenProbeSample.SSCoord[3] = (screenTileCoord00 + ivec2(1, 1)) * tileSize;
+
+    float epsilon = .01f;
+    vec4 scenePlane = vec4(worldNormal, dot(wsPosition, worldNormal));
+
+    // 上面拿到了均匀的probe的weight下面看看用adaptive的probe会不会更好
+    // 替换掉4个均匀probe的其中一个
+    for (int cornerIndex = 0; cornerIndex < 4; cornerIndex++)
+    {
+        // 如果四个中的其中一个权重太小，则由adaptive替换
+        if (screenProbeSample.weights[cornerIndex] <= epsilon)
+        {
+            ivec2 screenTileCoord = screenTileCoord00 + ivec2(cornerIndex % 2, cornerIndex / 2);
+            
+            // 这个被替换的tile中有多少个adaptive probe
+            int numAdaptiveProbes = screenTileHeaderData[screenTileCoord.y * ((int) viewport_width / tileSize) + screenTileCoord.x];
+
+            // 之前已经计算过均匀的probe带来的weight，下面试试取Adaptive probe插值
+            for (int adaptiveProbeListIndex = 0; adaptiveProbeListIndex < numAdaptiveProbes; adaptiveProbeListIndex++)
+            {
+                ivec2 adaptiveProbeCoord = GetAdaptiveProbeCoord(screenTileCoord, adaptiveProbeListIndex);
+
+                int adaptiveProbeIndex = screenTileProbeIndex[(int)(adaptiveProbeCoord.y * viewport_width + adaptiveProbeCoord.x)];
+
+                ivec2 screenProbeScreenPosition =  (ivec2) adaptiveProbeSSPosData[adaptiveProbeIndex].rg;
+
+                float probeDepth = texelFetch(depthTexture, screenProbeScreenPosition, 0).r;
+                
+                float newDepthWeight = 0;
+                bool bPlaneWeighting = true;
+                if (bPlaneWeighting)
+                {
+                    vec3 probePosition = texelFetch(ws_positionTexture, screenProbeScreenPosition, 0).rgb;
+                    float planeDistance = abs(dot(vec4(probePosition, -1), scenePlane));
+                    float relativeDepthDifference = planeDistance / sceneDepth;
+                    newDepthWeight = exp2(-10000.0f * (relativeDepthDifference * relativeDepthDifference));
+                }
+                else
+                {
+                    float depthDifference = abs(probeDepth - sceneDepth);
+                    float relativeDepthDifference = depthDifference / sceneDepth;
+                    newDepthWeight = probeDepth > 0 ? exp2(-100.0f * (relativeDepthDifference * relativeDepthDifference)) : 0;
+                }
+
+                vec2 distanceToScreenProbe = abs(screenProbeScreenPosition - screenCoord);
+                float newCornerWeight = 1.0f - clamp(min(distanceToScreenProbe.x, distanceToScreenProbe.y) / (float) screenProbeDownsampleFactor, 0,1);
+                float newInterpolationWeight = newDepthWeight * newCornerWeight;
+
+                if (newInterpolationWeight > screenProbeSample.weights[cornerIndex])
+                {
+                    screenProbeSample.weights[cornerIndex] = newInterpolationWeight;
+                    screenProbeSample.SSCoord[cornerIndex] = screenProbeScreenPosition;
+                }
+            }
+        }
+    }
+}
+
+void main () {
+
+    // uniform position
+    ivec2 screenCoord = ivec2(gl_GlobalInvocationID.xy) * placementDownsampleFactor;
+
+    if(gl_LocalInvocationIndex == 0){
+        probeNum = 0;
+    }
+
+    if((screenCoord.x < viewport_width && screenCoord.y < viewport_height) && 
+        ((gl_GlobalInvocationID.x & 0x1) != 0 || (gl_GlobalInvocationID.y & 0x1) != 0))
+    {
+        vec3 wsPosition = texelFetch(ws_positionTexture, screenCoord + ivec2(0.5, 0.5), 0).rgb;
+        float depth = texelFetch(depthTexture, screenCoord, 0).r;
+        vec3 wsNormal = texelFetch(ws_normalTexture, screenCoord, 0).rgb;
+
+
+        // 计算weights
+        FScreenProbeSample screenProbeSample;
+        CalculateUpsampleInterpolationWeights(screenCoord, wsPosition, depth, wsNormal, screenProbeSample);
+
+        // 计算该Probe是否保留
+        // weights归一化
+        float epsilon = .01f;
+        screenProbeSample.weights /= max(dot(screenProbeSample.weights, vec4(1,1,1,1)), epsilon);
+
+        bool lightingIsValid = (dot(screenProbeSample.weights, vec4(1,1,1,1)) < 1.0f - epsilon) ? false : true;
+
+        if (!lightingIsValid)
+        {
+            int Gindex = atomicAdd(probeNum, 1);
+            adaptiveProbeWSPosData[Gindex] = vec4(wsPosition,0.0f);
+            adaptiveProbeSSPosData[Gindex] = vec4(screenCoord.x,screenCoord.y, 0, 0);
+
+            int tileid = int(screenCoord.y / screenProbeDownsampleFactor * viewport_width / screenProbeDownsampleFactor + screenCoord.x / screenProbeDownsampleFactor);
+            int Tindex = atomicAdd(screenTileHeaderData[tileid], 1);
+            ivec2 adaptiveProbeCoord = GetAdaptiveProbeCoord(ivec2(screenCoord.x / screenProbeDownsampleFactor, screenCoord.y / screenProbeDownsampleFactor), Tindex);
+            screenTileProbeIndex[(int)(adaptiveProbeCoord.y * viewport_width + adaptiveProbeCoord.x)] = Gindex;
+            
+        }
+    }
+}

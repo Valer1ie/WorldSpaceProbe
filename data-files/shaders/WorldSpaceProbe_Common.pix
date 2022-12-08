@@ -1,0 +1,8 @@
+#version 420
+#extension GL_ARB_texture_query_lod : enable
+
+#define USED_PROBE_INDEX 0xFFFFFFFE
+#define RADIANCE_PROBE_MAX_CLIPMAPS 6
+#define INVALID_PROBE_INDEX 0xFFFFFFFF
+
+
